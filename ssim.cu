@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <iostream>
 #include <c10/cuda/CUDAGuard.h>
+#include "../diff-gaussian-rasterization/third_party/auto-jvp-example/cuda/float_grad_base.h"
+#include "../diff-gaussian-rasterization/third_party/auto-jvp-example/cuda/float_grad_array.h"
 
 namespace cg = cooperative_groups;
 
@@ -40,6 +42,15 @@ __device__ float get_pix_value(const float* img, const int b, const int c, const
     return img[b * CH * H * W + c * H * W + y * W + x];
   }
 }
+__device__ FloatGrad<float> get_pix_value_jvp(const FloatGradArray<float> img, const int b, const int c, const int y, const int x, const int CH, const int H, const int W) {
+  // static_assert(false, "check compile");
+  if (x >= W || y >= H || x < 0 || y < 0) {
+    return FloatGrad<float>(0.0f, 0.0f);
+  } else {
+    int idx = b * CH * H * W + c * H * W + y * W + x;
+    return FloatGrad<float>(img.data_ptr()[idx], img.grad_ptr()[idx]);
+  }
+}
 
 __device__ void load_into_shared(float pixels[SY][SSX], const float *inp, const int CH, const int H, const int W, const int i) {
   auto block = cg::this_thread_block();
@@ -61,6 +72,28 @@ __device__ void load_into_shared(float pixels[SY][SSX], const float *inp, const 
     }
   }
 }
+__device__ void load_into_shared_jvp(FloatGrad<float> pixels[SY][SSX], const FloatGradArray<float> inp, const int CH, const int H, const int W, const int i) {
+  auto block = cg::this_thread_block();
+  const int batch = block.group_index().z;
+  const int start_y = block.group_index().y * BY;
+  const int start_x = block.group_index().x * BX;
+
+  const int cnt = SY * SX;
+  const int num_blocks = (cnt + BX * BY - 1) / (BX * BY);
+  for (int b = 0; b < num_blocks; ++b) {
+    int tid = b * (BX * BY) + block.thread_rank();
+    if (tid < cnt) {
+      int local_y = tid / SX;
+      int local_x = tid % SX;
+      int y = start_y + local_y;
+      int x = start_x + local_x;
+      FloatGrad<float> one = get_pix_value_jvp(inp, batch, i, y - 5, x - 5, CH, H, W); // FloatGradRef<float> = {data_ptr, grad_ptr} = FloatGradArray<float>[idx]; FloatGradRef.data_ptr_ = &FloatGrad.data_, FloatGradRef.grad_ptr_ = &FloatGrad.grad_
+      pixels[local_y][local_x].data() = get_data(one);
+      pixels[local_y][local_x].grad() = get_grad(one);
+    }
+  }
+  // static_assert(false, "check compile");
+}
 
 __device__ void multiply_shared_mem(float pix1[SY][SSX], float pix2[SY][SSX]) {
   auto block = cg::this_thread_block();
@@ -77,9 +110,33 @@ __device__ void multiply_shared_mem(float pix1[SY][SSX], float pix2[SY][SSX]) {
     }
   }
 }
+__device__ void multiply_shared_mem_jvp(FloatGrad<float> pix1[SY][SSX], FloatGrad<float> pix2[SY][SSX]) {
+  auto block = cg::this_thread_block();
+  const int cnt = SY * SX;
+  const int num_blocks = (cnt + BX * BY - 1) / (BX * BY);
+  for (int b = 0; b < num_blocks; ++b) {
+    int tid = b * (BX * BY) + block.thread_rank();
+    if (tid < cnt) {
+      int local_y = tid / SX;
+      int local_x = tid % SX;
+      FloatGrad<float> one = pix1[local_y][local_x];
+      FloatGrad<float> two = pix2[local_y][local_x];
+      pix1[local_y][local_x].data() = get_data(one) * get_data(two);
+      pix1[local_y][local_x].grad() = get_grad(one) * get_grad(two);
+    }
+  }
+  // static_assert(false, "check compile");
+}
 
 __device__ inline float do_sq(float val) {
   return val * val;
+}
+__device__ inline FloatGrad<float> do_sq_jvp(FloatGrad<float> val) {
+  FloatGrad<float> result;
+  result.data() = get_data(val) * get_data(val);
+  result.grad() = get_data(val) * get_grad(val);
+  // static_assert(false, "check compile");
+  return result;
 }
 
 __device__ void
@@ -95,6 +152,22 @@ flush_conv_scratch(float buf[CY][CCX]) {
       buf[local_y][local_x] = 0.0f;
     }
   }
+}
+__device__ void 
+flush_conv_scratch_jvp(FloatGrad<float> buf[CY][CCX]) { 
+  auto block = cg::this_thread_block();
+  const int cnt = CY * CX;
+  const int num_blocks = (cnt + BX * BY - 1) / (BX * BY);
+  for (int b = 0; b < num_blocks; ++b) {
+    const int tid = b * (BX * BY) + block.thread_rank();
+    if (tid < cnt) {
+      const int local_y = tid / CX;
+      const int local_x = tid % CX;
+      FloatGrad<float> val = {0.0f, 0.0f}; 
+      buf[local_y][local_x] = val; 
+    }
+  }
+  // static_assert(false, "check compile");
 }
 
 __device__ void do_separable_conv_x(float pixels[SY][SSX], float opt[CY][CCX], int H, int W, bool sq = false) {
@@ -162,6 +235,72 @@ __device__ void do_separable_conv_x(float pixels[SY][SSX], float opt[CY][CCX], i
     opt[local_y][local_x] = val;
   }
 }
+__device__ void do_separable_conv_x_jvp(FloatGrad<float> pixels[SY][SSX], FloatGrad<float> opt[CY][CCX], int H, int W, bool sq = false) {
+  auto block = cg::this_thread_block();
+
+  int local_y = block.thread_index().y;
+  int local_x = block.thread_index().x + 5;
+  FloatGrad<float> val = {0.0f, 0.0f};
+
+  if (sq) {
+    val += G_00 * do_sq_jvp(pixels[local_y][local_x - 5]); 
+    val += G_01 * do_sq_jvp(pixels[local_y][local_x - 4]);
+    val += G_02 * do_sq_jvp(pixels[local_y][local_x - 3]);
+    val += G_03 * do_sq_jvp(pixels[local_y][local_x - 2]);
+    val += G_04 * do_sq_jvp(pixels[local_y][local_x - 1]);
+    val += G_05 * do_sq_jvp(pixels[local_y][local_x    ]);
+    val += G_06 * do_sq_jvp(pixels[local_y][local_x + 1]);
+    val += G_07 * do_sq_jvp(pixels[local_y][local_x + 2]);
+    val += G_08 * do_sq_jvp(pixels[local_y][local_x + 3]);
+    val += G_09 * do_sq_jvp(pixels[local_y][local_x + 4]);
+    val += G_10 * do_sq_jvp(pixels[local_y][local_x + 5]);
+  } else {
+    val += G_00 * pixels[local_y][local_x - 5];
+    val += G_01 * pixels[local_y][local_x - 4];
+    val += G_02 * pixels[local_y][local_x - 3];
+    val += G_03 * pixels[local_y][local_x - 2];
+    val += G_04 * pixels[local_y][local_x - 1];
+    val += G_05 * pixels[local_y][local_x    ];
+    val += G_06 * pixels[local_y][local_x + 1];
+    val += G_07 * pixels[local_y][local_x + 2];
+    val += G_08 * pixels[local_y][local_x + 3];
+    val += G_09 * pixels[local_y][local_x + 4];
+    val += G_10 * pixels[local_y][local_x + 5];
+  }
+  opt[local_y][local_x] = val;
+
+  val = {0.0f, 0.0f};
+  local_y = block.thread_index().y + BY;
+  if (local_y < SY) {
+    if (sq) {
+      val += G_00 * do_sq_jvp(pixels[local_y][local_x - 5]);
+      val += G_01 * do_sq_jvp(pixels[local_y][local_x - 4]);
+      val += G_02 * do_sq_jvp(pixels[local_y][local_x - 3]);
+      val += G_03 * do_sq_jvp(pixels[local_y][local_x - 2]);
+      val += G_04 * do_sq_jvp(pixels[local_y][local_x - 1]);
+      val += G_05 * do_sq_jvp(pixels[local_y][local_x    ]);
+      val += G_06 * do_sq_jvp(pixels[local_y][local_x + 1]);
+      val += G_07 * do_sq_jvp(pixels[local_y][local_x + 2]);
+      val += G_08 * do_sq_jvp(pixels[local_y][local_x + 3]);
+      val += G_09 * do_sq_jvp(pixels[local_y][local_x + 4]);
+      val += G_10 * do_sq_jvp(pixels[local_y][local_x + 5]);
+    } else {
+      val += G_00 * pixels[local_y][local_x - 5];
+      val += G_01 * pixels[local_y][local_x - 4];
+      val += G_02 * pixels[local_y][local_x - 3];
+      val += G_03 * pixels[local_y][local_x - 2];
+      val += G_04 * pixels[local_y][local_x - 1];
+      val += G_05 * pixels[local_y][local_x    ];
+      val += G_06 * pixels[local_y][local_x + 1];
+      val += G_07 * pixels[local_y][local_x + 2];
+      val += G_08 * pixels[local_y][local_x + 3];
+      val += G_09 * pixels[local_y][local_x + 4];
+      val += G_10 * pixels[local_y][local_x + 5];
+    }
+    opt[local_y][local_x] = val;
+  }
+  // static_assert(false, "check compile");
+}
 
 __device__ float do_separable_conv_y(float pixels[CY][CCX], int H, int W, bool sq = false) {
   auto block = cg::this_thread_block();
@@ -180,6 +319,28 @@ __device__ float do_separable_conv_y(float pixels[CY][CCX], int H, int W, bool s
   val += G_08 * pixels[local_y + 3][local_x];
   val += G_09 * pixels[local_y + 4][local_x];
   val += G_10 * pixels[local_y + 5][local_x];
+
+  return val;
+}
+__device__ FloatGrad<float> do_separable_conv_y_jvp(FloatGrad<float> pixels[CY][CCX], int H, int W, bool sq = false) {
+  auto block = cg::this_thread_block();
+  int local_y = block.thread_index().y + 5;
+  int local_x = block.thread_index().x + 5;
+  FloatGrad<float> val = {0.0f, 0.0f};
+
+  val += G_00 * pixels[local_y - 5][local_x];
+  val += G_01 * pixels[local_y - 4][local_x];
+  val += G_02 * pixels[local_y - 3][local_x];
+  val += G_03 * pixels[local_y - 2][local_x];
+  val += G_04 * pixels[local_y - 1][local_x];
+  val += G_05 * pixels[local_y    ][local_x];
+  val += G_06 * pixels[local_y + 1][local_x];
+  val += G_07 * pixels[local_y + 2][local_x];
+  val += G_08 * pixels[local_y + 3][local_x];
+  val += G_09 * pixels[local_y + 4][local_x];
+  val += G_10 * pixels[local_y + 5][local_x];
+
+  // static_assert(false, "check compile");
 
   return val;
 }
@@ -284,6 +445,111 @@ __global__ void fusedssimCUDA(
     }
   }
 }
+__global__ void fusedssimCUDAJvp(
+  int H,
+  int W,
+  int CH,
+  float C1,
+  float C2,
+  FloatGradArray<float> img1,
+  FloatGradArray<float> img2,
+  FloatGradArray<float> ssim_map,
+  FloatGradArray<float> dm_dmu1,
+  FloatGradArray<float> dm_dsigma1_sq,
+  FloatGradArray<float> dm_dsigma12
+)
+{
+  dm_dmu1 = FloatGradArray<float>(nullptr, nullptr);
+  dm_dsigma1_sq = FloatGradArray<float>(nullptr, nullptr);
+  dm_dsigma12 = FloatGradArray<float>(nullptr, nullptr);
+
+  auto block = cg::this_thread_block();
+  const int pix_y = block.group_index().y * BY + block.thread_index().y;
+  const int pix_x = block.group_index().x * BX + block.thread_index().x;
+  const int pix_id = pix_y * W + pix_x;
+  const int num_pix = H * W;
+  const int batch = block.group_index().z;
+
+  // shared memory that will be used to load pixels temporarily
+  __shared__ FloatGrad<float> buf1[SY][SSX];
+  __shared__ FloatGrad<float> buf2[SY][SSX];
+  __shared__ FloatGrad<float> buf3[CY][CCX];
+
+  for (int i = 0; i < CH; ++i) {
+    // load into shared
+    load_into_shared_jvp(buf1, img1, CH, H, W, i);
+    block.sync();
+
+    // calculate mu1
+    flush_conv_scratch_jvp(buf3);
+    block.sync();
+    do_separable_conv_x_jvp(buf1, buf3, H, W);
+    block.sync();
+    FloatGrad<float> mu1 = do_separable_conv_y_jvp(buf3, H, W);
+    block.sync();
+
+    // calculate sigma1_sq
+    flush_conv_scratch_jvp(buf3);
+    block.sync();
+    do_separable_conv_x_jvp(buf1, buf3, H, W, true);
+    block.sync();
+    FloatGrad<float> sigma1_sq = do_separable_conv_y_jvp(buf3, H, W) - mu1 * mu1;
+    block.sync();
+
+    // calculate mu2
+    load_into_shared_jvp(buf2, img2, CH, H, W, i);
+    block.sync();
+    flush_conv_scratch_jvp(buf3);
+    block.sync();
+    do_separable_conv_x_jvp(buf2, buf3, H, W);
+    block.sync();
+    FloatGrad<float> mu2 = do_separable_conv_y_jvp(buf3, H, W);
+    block.sync();
+
+    // calculate sigma2_sq
+    flush_conv_scratch_jvp(buf3);
+    block.sync();
+    do_separable_conv_x_jvp(buf2, buf3, H, W, true);
+    block.sync();
+    FloatGrad<float> sigma2_sq = do_separable_conv_y_jvp(buf3, H, W) - mu2 * mu2;
+    block.sync();
+
+    // calculate sigma12
+    multiply_shared_mem_jvp(buf1, buf2);
+    block.sync();
+    flush_conv_scratch_jvp(buf3);
+    block.sync();
+    do_separable_conv_x_jvp(buf1, buf3, H, W);
+    block.sync();
+    FloatGrad<float> sigma12 = do_separable_conv_y_jvp(buf3, H, W) - mu1 * mu2;
+    block.sync();
+
+    FloatGrad<float> mu1_sq = mu1 * mu1;
+    FloatGrad<float> mu2_sq = mu2 * mu2;
+    FloatGrad<float> mu1_mu2 = mu1 * mu2;
+    FloatGrad<float> C = (2.0f * mu1_mu2 + C1);
+    FloatGrad<float> D = (2.0f * sigma12 + C2);
+    FloatGrad<float> A = (mu1_sq + mu2_sq + C1);
+    FloatGrad<float> B = (sigma1_sq + sigma2_sq + C2);
+    FloatGrad<float> m = (C * D) / (A * B);
+    if (pix_x < W && pix_y < H) {
+      const int global_idx = batch * CH * num_pix + i * num_pix + pix_id;
+      ssim_map[global_idx] = m;
+
+      if (dm_dmu1.data_ptr()) {
+        dm_dmu1[global_idx] = (
+          (mu2 * 2.0f * D) / (A * B)
+          -(mu2 * 2.0f * C) / (A * B)
+          -(mu1 * 2.0f * C * D) / ( A * A * B)
+          +(mu1 * 2.0f * C * D) / (A * B * B)
+        );
+        dm_dsigma1_sq[global_idx] = (((-1) *C * D) / (A * B * B));
+        dm_dsigma12[global_idx] = ((2 * C) / (A * B));
+      }
+    }
+  }
+  // static_assert(false, "check compile");
+}
 
 __global__ void fusedssim_backwardCUDA(
   int H,
@@ -364,6 +630,91 @@ __global__ void fusedssim_backwardCUDA(
     }
   }
 }
+__global__ void fusedssim_backwardCUDAJvp(
+  int H,
+  int W,
+  int CH,
+  float C1,
+  float C2,
+  FloatGradArray<float> img1,
+  FloatGradArray<float> img2,
+  FloatGradArray<float> dL_dmap,
+  FloatGradArray<float> dL_dimg1,
+  FloatGradArray<float> dm_dmu1,
+  FloatGradArray<float> dm_dsigma1_sq,
+  FloatGradArray<float> dm_dsigma12
+)
+{
+  dm_dmu1 = FloatGradArray<float>(nullptr, nullptr);
+  dm_dsigma1_sq = FloatGradArray<float>(nullptr, nullptr);
+  dm_dsigma12 = FloatGradArray<float>(nullptr, nullptr);
+
+  auto block = cg::this_thread_block();
+  const int pix_y = block.group_index().y * BY + block.thread_index().y;
+  const int pix_x = block.group_index().x * BX + block.thread_index().x;
+  const int pix_id = pix_y * W + pix_x;
+  const int num_pix = H * W;
+  const int batch = block.group_index().z;
+
+  // shared memory that will be used to load pixels temporarily
+  __shared__ FloatGrad<float> buf1[SY][SSX];
+  __shared__ FloatGrad<float> buf2[SY][SSX];
+  __shared__ FloatGrad<float> buf3[CY][CCX];
+
+  for (int i = 0; i < CH; ++i) {
+    FloatGrad<float> dL_dpix = {0.0f, 0.0f};
+    FloatGrad<float> tmp = {0.0f, 0.0f};
+    FloatGrad<float> pix1 = get_pix_value_jvp(img1, batch, i, pix_y, pix_x, CH, H, W);
+    FloatGrad<float> pix2 = get_pix_value_jvp(img2, batch, i, pix_y, pix_x, CH, H, W);
+    load_into_shared_jvp(buf1, dL_dmap, CH, H, W, i);
+
+    // gradient from mu1
+    load_into_shared_jvp(buf2, dm_dmu1, CH, H, W, i);
+    block.sync();
+    multiply_shared_mem_jvp(buf2, buf1);
+    block.sync();
+    flush_conv_scratch_jvp(buf3);
+    block.sync();
+    do_separable_conv_x_jvp(buf2, buf3, H, W);
+    block.sync();
+    tmp = do_separable_conv_y_jvp(buf3, H, W);
+    block.sync();
+    dL_dpix += tmp;
+
+    // gradient from sigma1_sq
+    load_into_shared_jvp(buf2, dm_dsigma1_sq, CH, H, W, i);
+    block.sync();
+    multiply_shared_mem_jvp(buf2, buf1);
+    block.sync();
+    flush_conv_scratch_jvp(buf3);
+    block.sync();
+    do_separable_conv_x_jvp(buf2, buf3, H, W);
+    block.sync();
+    tmp = pix1 * 2.0f * do_separable_conv_y_jvp(buf3, H, W);
+    block.sync();
+    dL_dpix += tmp;
+
+    // gradient from sigma12
+    load_into_shared_jvp(buf2, dm_dsigma12, CH, H, W, i);
+    block.sync();
+    multiply_shared_mem_jvp(buf2, buf1);
+    block.sync();
+    flush_conv_scratch_jvp(buf3);
+    block.sync();
+    do_separable_conv_x_jvp(buf2, buf3, H, W);
+    block.sync();
+    tmp = pix2 * do_separable_conv_y_jvp(buf3, H, W);
+    block.sync();
+    dL_dpix += tmp;
+
+    if (pix_x < W && pix_y < H) {
+      const int global_idx = batch * CH * num_pix + i * num_pix + pix_id;
+      dL_dimg1[global_idx] = dL_dpix;
+    }
+  }
+
+  // static_assert(false, "check compile");
+}
 
 std::tuple<torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor>
 fusedssim(
@@ -401,6 +752,72 @@ fusedssim(
   );
 
   return std::make_tuple(target, dm_dmu1, dm_dsigma1_sq, dm_dsigma12);
+}
+std::tuple<torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor,torch::Tensor>
+fusedssim_jvp(
+  float C1,
+  float C2,
+  torch::Tensor &img1,
+  torch::Tensor &img1_grad,
+  torch::Tensor &img2,
+  torch::Tensor &img2_grad,
+  bool train
+)
+{
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(img1));
+  int B = img1.size(0);
+  int CH = img1.size(1);
+  int H = img1.size(2);
+  int W = img1.size(3);
+  dim3 grid((W + BX - 1) / BX, (H + BY - 1) / BY, B);
+  dim3 block(BX, BY, 1);
+
+  torch::Tensor target = torch::zeros_like(img1);
+  torch::Tensor target_grad = torch::zeros_like(img1_grad);
+  torch::Tensor dm_dmu1 = train ? torch::zeros_like(img1) : torch::empty(0);
+  torch::Tensor dm_dmu1_grad = train ? torch::zeros_like(img1_grad) : torch::empty(0);
+  torch::Tensor dm_dsigma1_sq = train ? torch::zeros_like(img1) : torch::empty(0);
+  torch::Tensor dm_dsigma1_sq_grad = train ? torch::zeros_like(img1_grad) : torch::empty(0);
+  torch::Tensor dm_dsigma12 = train ? torch::zeros_like(img1) : torch::empty(0);
+  torch::Tensor dm_dsigma12_grad = train ? torch::zeros_like(img1_grad) : torch::empty(0);
+  
+  auto img1_contiguous = img1.contiguous();
+  auto img1_grad_contiguous = img1_grad.contiguous();
+  auto img2_contiguous = img2.contiguous();
+  auto img2_grad_contiguous = img2_grad.contiguous();
+  auto target_contiguous = target.contiguous();
+  auto target_grad_contiguous = target_grad.contiguous();
+  auto dm_dmu1_contiguous = dm_dmu1.contiguous();
+  auto dm_dmu1_grad_contiguous = dm_dmu1_grad.contiguous();
+  auto dm_dsigma1_sq_contiguous = dm_dsigma1_sq.contiguous();
+  auto dm_dsigma1_sq_grad_contiguous = dm_dsigma1_sq_grad.contiguous();
+  auto dm_dsigma12_contiguous = dm_dsigma12.contiguous();
+  auto dm_dsigma12_grad_contiguous = dm_dsigma12_grad.contiguous();
+
+  FloatGradArray<float> img1_floatgrad(img1_contiguous.data<float>(), img1_grad_contiguous.data<float>());
+  FloatGradArray<float> img2_floatgrad(img2_contiguous.data<float>(), img2_grad_contiguous.data<float>());
+  FloatGradArray<float> target_floatgrad(target_contiguous.data<float>(), target_grad_contiguous.data<float>());
+  FloatGradArray<float> dm_dmu1_floatgrad(dm_dmu1_contiguous.data<float>(), dm_dmu1_grad_contiguous.data<float>());
+  FloatGradArray<float> dm_dsigma1_sq_floatgrad(dm_dsigma1_sq_contiguous.data<float>(), dm_dsigma1_sq_grad_contiguous.data<float>());
+  FloatGradArray<float> dm_dsigma12_floatgrad(dm_dsigma12_contiguous.data<float>(), dm_dsigma12_grad_contiguous.data<float>());
+  
+  fusedssimCUDAJvp<<<grid,block>>>(
+    H,
+    W,
+    CH,
+    C1,
+    C2,
+    img1_floatgrad,
+    img2_floatgrad,
+    target_floatgrad,
+    dm_dmu1_floatgrad,
+    dm_dsigma1_sq_floatgrad,
+    dm_dsigma12_floatgrad
+  );
+
+  // static_assert(false, "check compile");
+
+  return std::make_tuple(target_contiguous, dm_dmu1_contiguous, dm_dsigma1_sq_contiguous, dm_dsigma12_contiguous, target_grad_contiguous, dm_dmu1_grad_contiguous, dm_dsigma1_sq_grad_contiguous, dm_dsigma12_grad_contiguous); 
 }
 
 torch::Tensor
@@ -441,4 +858,75 @@ fusedssim_backward(
   );
 
   return dL_dimg1;
+}
+std::tuple<torch::Tensor, torch::Tensor>
+fusedssim_backward_jvp(
+  float C1,
+  float C2,
+  torch::Tensor &img1,
+  torch::Tensor &img1_grad,
+  torch::Tensor &img2,
+  torch::Tensor &img2_grad,
+  torch::Tensor &dL_dmap,
+  torch::Tensor &dL_dmap_grad,
+  torch::Tensor &dm_dmu1,
+  torch::Tensor &dm_dmu1_grad,
+  torch::Tensor &dm_dsigma1_sq,
+  torch::Tensor &dm_dsigma1_sq_grad,
+  torch::Tensor &dm_dsigma12,
+  torch::Tensor &dm_dsigma12_grad
+)
+{
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(img1));
+  int B = img1.size(0);
+  int CH = img1.size(1);
+  int H = img1.size(2);
+  int W = img1.size(3);
+
+  torch::Tensor dL_dimg1 = torch::zeros_like(img1);
+  torch::Tensor dL_dimg1_grad = torch::zeros_like(img1_grad);
+
+  auto img1_contiguous = img1.contiguous();
+  auto img1_grad_contiguous = img1_grad.contiguous();
+  auto img2_contiguous = img2.contiguous();
+  auto img2_grad_contiguous = img2_grad.contiguous();
+  auto dL_dmap_contiguous = dL_dmap.contiguous();
+  auto dL_dmap_grad_contiguous = dL_dmap_grad.contiguous();
+  auto dL_dimg1_contiguous = dL_dimg1.contiguous();
+  auto dL_dimg1_grad_contiguous = dL_dimg1_grad.contiguous();
+  auto dm_dmu1_contiguous = dm_dmu1.contiguous();
+  auto dm_dmu1_grad_contiguous = dm_dmu1_grad.contiguous();
+  auto dm_dsigma1_sq_contiguous = dm_dsigma1_sq.contiguous();
+  auto dm_dsigma1_sq_grad_contiguous = dm_dsigma1_sq_grad.contiguous();
+  auto dm_dsigma12_contiguous = dm_dsigma12.contiguous();
+  auto dm_dsigma12_grad_contiguous = dm_dsigma12_grad.contiguous();
+
+  FloatGradArray<float> img1_floatgrad(img1_contiguous.data<float>(), img1_grad_contiguous.data<float>());
+  FloatGradArray<float> img2_floatgrad(img2_contiguous.data<float>(), img2_grad_contiguous.data<float>());
+  FloatGradArray<float> dL_dmap_floatgrad(dL_dmap_contiguous.data<float>(), dL_dmap_grad_contiguous.data<float>());
+  FloatGradArray<float> dL_dimg1_floatgrad(dL_dimg1_contiguous.data<float>(), dL_dimg1_grad_contiguous.data<float>());
+  FloatGradArray<float> dm_dmu1_floatgrad(dm_dmu1_contiguous.data<float>(), dm_dmu1_grad_contiguous.data<float>());
+  FloatGradArray<float> dm_dsigma1_sq_floatgrad(dm_dsigma1_sq_contiguous.data<float>(), dm_dsigma1_sq_grad_contiguous.data<float>());
+  FloatGradArray<float> dm_dsigma12_floatgrad(dm_dsigma12_contiguous.data<float>(), dm_dsigma12_grad_contiguous.data<float>());
+
+  dim3 grid((W + BX - 1) / BX, (H + BY - 1) / BY, B);
+  dim3 block(BX, BY, 1);
+  fusedssim_backwardCUDAJvp<<<grid,block>>>(
+    H,
+    W,
+    CH,
+    C1,
+    C2,
+    img1_floatgrad,
+    img2_floatgrad,
+    dL_dmap_floatgrad,
+    dL_dimg1_floatgrad,
+    dm_dmu1_floatgrad,
+    dm_dsigma1_sq_floatgrad,
+    dm_dsigma12_floatgrad
+  );
+
+  // static_assert(false, "check compile");
+
+  return std::make_tuple(dL_dimg1_contiguous, dL_dimg1_grad_contiguous); // added: dL_dimg1_grad 
 }
