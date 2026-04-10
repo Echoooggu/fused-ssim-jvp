@@ -8,6 +8,7 @@ allowed_padding = ["same", "valid"]
 class FusedSSIMMap(torch.autograd.Function):
     @staticmethod
     def forward(ctx, C1, C2, img1, img2, padding="same", train=True):
+        # print ("If you see this message, it means you are using the fused-ssim module.")
         ssim_map, dm_dmu1, dm_dsigma1_sq, dm_dsigma12 = fusedssim(C1, C2, img1, img2, train)
 
         if padding == "valid":
